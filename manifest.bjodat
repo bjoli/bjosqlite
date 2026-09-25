@@ -1,0 +1,17 @@
+(package
+  (name (bjosqlite))
+  (version "0.1.0")
+  (description "SQLite for Bjolang: the bjosql query language over Microsoft.Data.Sqlite.")
+  (license "MPL-2.0")
+
+  (depends
+    (package (name (bjosql)) (source (path (dir "../bjosql")))))
+
+  ;; Brings its own SQLite, built for each platform (SQLitePCLRaw's
+  ;; e_sqlite3), so nothing has to be installed. A program using this
+  ;; package declares nothing itself.
+  (packages
+    (nuget (id "Microsoft.Data.Sqlite") (version "10.0.12")))
+
+  ;; A library: there is no src/main.bjo.
+  )

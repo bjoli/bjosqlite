@@ -1,0 +1,64 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjosqlite/examples/todo.bjo — a to-do list in todo.db, in this directory.
+;;
+;;     bjo run examples/todo.bjo add "buy milk"
+;;     bjo run examples/todo.bjo add "write the report" 2
+;;     bjo run examples/todo.bjo done 1
+;;     bjo run examples/todo.bjo list
+;;     bjo run examples/todo.bjo clear
+
+(import (std prelude))
+(import (bjosql core))
+(import (bjosqlite core))
+
+(def/table todos Todo
+  (id int #:primary-key #:auto)
+  (title string)
+  (priority int)
+  (done bool)
+  (note (Option string)))
+
+;; A query built from what the command line asked for. The literal is read
+;; against the return type, through the `if`.
+(: wanted (-> bool TodoSelect))
+(defun (wanted all?)
+  (if all?
+      '(select (order-by (desc priority) id))
+      '(select (where (done (= #f))) (order-by (desc priority) id))))
+
+(: show (-> Todo void))
+(defun (show t)
+  (println (str (if (record-ref t done) "[x] " "[ ] ")
+                (int->string (record-ref t id)) ". "
+                (record-ref t title)
+                (if (> (record-ref t priority) 1) (str " (priority " (int->string (record-ref t priority)) ")") ""))))
+
+(: command (-> Db (List string) (Result SqlError string)))
+(defun (command db args)
+  (def (Ok _) (create-table db todos) :propagate)
+  (match args
+    ((Cons "add" (Cons title rest))
+     (def priority (match rest ((Cons p _) (string->int p)) (Nil 1)))
+     (def (Ok t) (insert db todos (Todo (id 0) (title title) (priority priority) (done #f) (note None)))
+       :propagate)
+     (Ok (str "added " (int->string (record-ref t id)))))
+    ((Cons "done" (Cons which _))
+     (def n (string->int which))
+     (def (Ok changed) (execute db todos '(update (set (done #t)) (where (id (= ,n))))) :propagate)
+     (Ok (if (= changed 0) (str "there is no " which) (str "done " which))))
+    ((Cons "clear" _)
+     (def (Ok removed) (execute db todos '(delete (where (done (= #t))))) :propagate)
+     (Ok (str "cleared " (int->string removed))))
+    (_
+     (def all? (match args ((Cons "all" _) #t) (_ #f)))
+     (def (Ok ts) (fetch db todos (wanted all?)) :propagate)
+     (loop (:for t ts) (:do (show t)))
+     (Ok (str (int->string (list-length ts)) (if all? " in all" " to do"))))))
+
+(defun (main args)
+  (match (call-with-db "todo.db" (fun (db) (command db (vec->list args))))
+    ((Ok said) (println said) 0)
+    ((Err e) (println (str "todo: " (sql-error-message e))) 1)))

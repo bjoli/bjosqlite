@@ -1,0 +1,336 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjosqlite/src/core.bjo — the module (bjosqlite core).
+;;
+;; SQLite, through Microsoft.Data.Sqlite, spoken in (bjosql core)'s language:
+;;
+;;     (def/table users User
+;;       (id int #:primary-key #:auto)
+;;       (name string))
+;;
+;;     (def (Ok db) (open-db "app.db") :propagate)
+;;     (def (Ok _) (create-table db users) :propagate)
+;;     (def (Ok ada) (insert db users (User (id 0) (name "Ada"))) :propagate)
+;;     (fetch db users '(select (where (name (like "A%"))) (order-by id)))
+;;
+;; Every operation answers a `Result` with a `SqlError`: what the database
+;; refused, or a row that did not fit its record. Anything else that goes
+;; wrong — a closed connection, a bug — is an exception, as it is everywhere.
+;;
+;; A call blocks the thread it is made on, as SQLite does. SQLite is a library
+;; in this process rather than a server, so most calls are over in
+;; microseconds; a long one made from a bjoroutine can be moved off the fiber
+;; with `(sync (blocking (fun () ...)))`. A `Db` is one connection and is not
+;; for two threads at once.
+
+(export
+  Db open-db close-db call-with-db db-path
+  sqlite-dialect
+
+  ;; With a table
+  create-table insert insert-all fetch fetch-one fetch-rows execute
+
+  ;; By hand
+  execute-sql query-sql
+
+  with-transaction)
+
+(import (std prelude))
+(import (bjosql core))
+
+(import/class
+  (Object (: System.Object))
+  (Type (: System.Type))
+  (Exception (: System.Exception))
+  (Connection (: Microsoft.Data.Sqlite.SqliteConnection (-> string Connection)))
+  (ConnectionStringBuilder (: Microsoft.Data.Sqlite.SqliteConnectionStringBuilder (-> ConnectionStringBuilder)))
+  (Command (: Microsoft.Data.Sqlite.SqliteCommand))
+  (Parameters (: Microsoft.Data.Sqlite.SqliteParameterCollection))
+  (Parameter (: Microsoft.Data.Sqlite.SqliteParameter))
+  (Reader (: Microsoft.Data.Sqlite.SqliteDataReader))
+  (SqliteException (: Microsoft.Data.Sqlite.SqliteException)))
+
+(import/extern
+  (builder-data-source! (: Microsoft.Data.Sqlite.SqliteConnectionStringBuilder.DataSource
+                           (-> ConnectionStringBuilder string void) #:set))
+  (builder-string (: Microsoft.Data.Sqlite.SqliteConnectionStringBuilder.ConnectionString
+                     (-> ConnectionStringBuilder string) #:get))
+
+  (connection-open (: Microsoft.Data.Sqlite.SqliteConnection.Open (-> Connection void)))
+  (connection-dispose (: Microsoft.Data.Sqlite.SqliteConnection.Dispose (-> Connection void)))
+  (connection-command (: Microsoft.Data.Sqlite.SqliteConnection.CreateCommand (-> Connection Command)))
+
+  (command-text! (: Microsoft.Data.Sqlite.SqliteCommand.CommandText (-> Command string void) #:set))
+  (command-parameters (: Microsoft.Data.Sqlite.SqliteCommand.Parameters (-> Command Parameters) #:get))
+  (command-execute (: Microsoft.Data.Sqlite.SqliteCommand.ExecuteNonQuery (-> Command int)))
+  (command-reader (: Microsoft.Data.Sqlite.SqliteCommand.ExecuteReader (-> Command Reader)))
+  (command-dispose (: Microsoft.Data.Sqlite.SqliteCommand.Dispose (-> Command void)))
+
+  ;; AddWithValue takes an object; `bind!` boxes each value with `cast`.
+  (add-value (: Microsoft.Data.Sqlite.SqliteParameterCollection.AddWithValue (-> Parameters string Object Parameter)))
+  (db-null (: System.DBNull.Value #:get))
+
+  (reader-read (: Microsoft.Data.Sqlite.SqliteDataReader.Read (-> Reader bool)))
+  (reader-field-count (: Microsoft.Data.Sqlite.SqliteDataReader.FieldCount (-> Reader int) #:get))
+  (reader-name (: Microsoft.Data.Sqlite.SqliteDataReader.GetName (-> Reader int string)))
+  (reader-null? (: Microsoft.Data.Sqlite.SqliteDataReader.IsDBNull (-> Reader int bool)))
+  (reader-field-type (: Microsoft.Data.Sqlite.SqliteDataReader.GetFieldType (-> Reader int Type)))
+  (reader-long (: Microsoft.Data.Sqlite.SqliteDataReader.GetInt64 (-> Reader int long)))
+  (reader-double (: Microsoft.Data.Sqlite.SqliteDataReader.GetDouble (-> Reader int double)))
+  (reader-string (: Microsoft.Data.Sqlite.SqliteDataReader.GetString (-> Reader int string)))
+  (reader-value (: Microsoft.Data.Sqlite.SqliteDataReader.GetValue (-> Reader int Object)))
+  (reader-dispose (: Microsoft.Data.Sqlite.SqliteDataReader.Dispose (-> Reader void)))
+
+  (type-name (: System.Type.Name (-> Type string) #:get))
+  (exception-message (: System.Exception.Message (-> Exception string) #:get))
+  (sqlite-error-code (: Microsoft.Data.Sqlite.SqliteException.SqliteErrorCode (-> SqliteException int) #:get)))
+
+
+;; ---------------------------------------------------------------------------
+;; The dialect
+;; ---------------------------------------------------------------------------
+
+;; SQLite's column types are affinities, and these are the names that give
+;; each Bjolang type the one it wants. `BOOLEAN` has NUMERIC affinity and
+;; stores 0 and 1.
+(: sqlite-type-name (-> ColumnType string))
+(defun (sqlite-type-name t)
+  (match t
+    ((IntegerType) "INTEGER")
+    ((RealType) "REAL")
+    ((TextType) "TEXT")
+    ((BlobType) "BLOB")
+    ((BoolType) "BOOLEAN")
+    ((CustomType name) name)))
+
+;; `@p1`, `@p2`: Microsoft.Data.Sqlite binds parameters by name. An
+;; `INTEGER PRIMARY KEY` is SQLite's rowid and numbers itself, so `#:auto`
+;; adds nothing to it; and an OFFSET needs a LIMIT, which -1 makes endless.
+(: sqlite-dialect Dialect)
+(def sqlite-dialect
+  (record-set standard-dialect
+              (placeholder (fun (n) (str "@p" (int->string n))))
+              (type-name sqlite-type-name)
+              (auto-key "")
+              (no-limit " LIMIT -1")))
+
+
+;; ---------------------------------------------------------------------------
+;; The connection
+;; ---------------------------------------------------------------------------
+
+;; One open connection. `depth` counts the transactions open on it, which
+;; names their savepoints.
+(type (: Db #:opaque (Record (: connection Connection)
+                             (: path string)
+                             (: depth int #:mutable))))
+
+(: db-path (-> Db string))
+(defun (db-path db) (record-ref db path))
+
+;; What the database said, as a `SqlError`. Only SQLite's own errors are
+;; caught: anything else is not the database's answer.
+(: failed (-> Exception SqlError))
+(defun (failed e)
+  (match e
+    ((:is Microsoft.Data.Sqlite.SqliteException se) (DbError (int->string (sqlite-error-code se)) (exception-message e)))
+    (_ (DbError "" (exception-message e)))))
+
+(: sqlite (-> (-> %a) (Result SqlError %a)))
+(defun (sqlite thunk)
+  (match (try (thunk) #:catch (Microsoft.Data.Sqlite.SqliteException))
+    ((Ok x) (Ok x))
+    ((Err e) (Err (failed e)))))
+
+;; Opens the database in the file at `path`, creating it if there is none.
+;; `":memory:"` is a database in memory, gone when it is closed.
+(: open-db (-> string (Result SqlError Db)))
+(defun (open-db path)
+  (def builder (ConnectionStringBuilder.))
+  (builder-data-source! builder path)
+  (sqlite (fun ()
+            (def c (Connection. (builder-string builder)))
+            (connection-open c)
+            (Db (connection c) (path path) (depth 0)))))
+
+(: close-db (-> Db void))
+(defun (close-db db) (connection-dispose (record-ref db connection)))
+
+;; Opens the database, hands it to `f`, and closes it when `f` returns —
+;; however it returns.
+(: call-with-db (-> string (-> Db (Result SqlError %a)) (Result SqlError %a)))
+(defun (call-with-db path f)
+  (match (open-db path)
+    ((Err e) (Err e))
+    ((Ok db) (try (f db) #:finally (close-db db)))))
+
+
+;; ---------------------------------------------------------------------------
+;; Running statements
+;; ---------------------------------------------------------------------------
+
+(: bind! (-> Parameters int SqlValue void))
+(defun (bind! ps n v)
+  (def name (str "@p" (int->string n)))
+  (def value
+    (match v
+      ((SqlNull) (cast System.Object db-null))
+      ((SqlInt i) (cast System.Object i))
+      ((SqlReal d) (cast System.Object d))
+      ((SqlText s) (cast System.Object s))
+      ((SqlBlob b) (cast System.Object b))
+      ((SqlBool b) (cast System.Object b))))
+  (ignore (add-value ps name value)))
+
+;; A command for `s`, with its parameters bound, handed to `f` and disposed of
+;; afterwards.
+(: with-command (-> Db Sql (-> Command %a) %a))
+(defun (with-command db s f)
+  (def st (render sqlite-dialect s))
+  (def cmd (connection-command (record-ref db connection)))
+  (try
+    (do-command cmd st f)
+    #:finally (command-dispose cmd)))
+
+(: do-command (-> Command Statement (-> Command %a) %a))
+(defun (do-command cmd st f)
+  (command-text! cmd (statement-text st))
+  (def ps (command-parameters cmd))
+  (loop (:for v (statement-params st))
+        (:with n 1 (+ n 1))
+        (:do (bind! ps n v)))
+  (f cmd))
+
+;; A value as SQLite stored it. The field type is the storage class of this
+;; row's value, not the column's declared type.
+(: read-value (-> Reader int SqlValue))
+(defun (read-value r i)
+  (if (reader-null? r i)
+      SqlNull
+      (let ((stored (type-name (reader-field-type r i))))
+        (cond
+          ((= stored "Int64") (SqlInt (reader-long r i)))
+          ((= stored "Double") (SqlReal (reader-double r i)))
+          ((= stored "Byte[]") (SqlBlob (cast (Array byte) (reader-value r i))))
+          (else (SqlText (reader-string r i)))))))
+
+(: read-rows (-> Reader (List Row)))
+(defun (read-rows r)
+  (def count (reader-field-count r))
+  (def names (loop (:for i (range 0 count)) (:acc out (vecing (reader-name r i))) => out))
+  (let go ((out Nil))
+    (if (reader-read r)
+        (go (Cons (make-row names (loop (:for i (range 0 count))
+                                        (:acc vs (vecing (read-value r i)))
+                                        => vs))
+                  out))
+        (list-reverse out))))
+
+;; Runs a statement that answers no rows, and answers how many it changed.
+(: execute-sql (-> Db Sql (Result SqlError int)))
+(defun (execute-sql db s)
+  (sqlite (fun () (with-command db s command-execute))))
+
+;; Runs a query, and answers its rows.
+(: query-sql (-> Db Sql (Result SqlError (List Row))))
+(defun (query-sql db s)
+  (sqlite (fun ()
+            (with-command db s
+              (fun (cmd)
+                (def r (command-reader cmd))
+                (try (read-rows r) #:finally (reader-dispose r)))))))
+
+
+;; ---------------------------------------------------------------------------
+;; With a table
+;; ---------------------------------------------------------------------------
+
+(: create-table (-> Db (Table %row %col %test %set) (Result SqlError void)))
+(defun (create-table db table)
+  (match (execute-sql db (create-table->sql table))
+    ((Ok _) (Ok unit))
+    ((Err e) (Err e))))
+
+;; Inserts a row, and answers it as stored — with the key SQLite chose for an
+;; `#:auto` column, whatever the record said.
+(: insert (-> Db (Table %row %col %test %set) %row (Result SqlError %row)))
+(defun (insert db table row)
+  (match (query-sql db (insert->sql table row))
+    ((Ok (Cons stored _)) (decode-row table stored))
+    ((Ok Nil) (Err (DecodeError (str "inserting into " (table-name table) " returned no row."))))
+    ((Err e) (Err e))))
+
+;; Every row or none: in one transaction.
+(: insert-all (-> Db (Table %row %col %test %set) (List %row) (Result SqlError (List %row))))
+(defun (insert-all db table rows)
+  (with-transaction db
+    (fun ()
+      (let go ((left rows) (out Nil))
+        (match left
+          (Nil (Ok (list-reverse out)))
+          ((Cons row more)
+           (match (insert db table row)
+             ((Ok stored) (go more (Cons stored out)))
+             ((Err e) (Err e)))))))))
+
+;; The rows a query selects, read into the table's record. A projection has
+;; to name every column for that; `fetch-rows` reads any.
+(: fetch (-> Db (Table %row %col %test %set) (Select %col %test) (Result SqlError (List %row))))
+(defun (fetch db table q)
+  (match (query-sql db (select->sql table q))
+    ((Ok rows) (decode-rows table rows))
+    ((Err e) (Err e))))
+
+;; The first row, if there is one. Asks for one, whatever the query's limit.
+(: fetch-one (-> Db (Table %row %col %test %set) (Select %col %test) (Result SqlError (Option %row))))
+(defun (fetch-one db table q)
+  (def (SelectQuery clauses) q)
+  (match (fetch db table (SelectQuery (list-append clauses (list (Limit 1)))))
+    ((Ok (Cons row _)) (Ok (Some row)))
+    ((Ok Nil) (Ok None))
+    ((Err e) (Err e))))
+
+;; The rows as they came, for a projection: `(row-field row "name")`.
+(: fetch-rows (-> Db (Table %row %col %test %set) (Select %col %test) (Result SqlError (List Row))))
+(defun (fetch-rows db table q) (query-sql db (select->sql table q)))
+
+;; An update or a delete, answering how many rows it changed.
+(: execute (-> Db (Table %row %col %test %set) (Change %set %test) (Result SqlError int)))
+(defun (execute db table change)
+  (match (change->sql table change)
+    ((Ok s) (execute-sql db s))
+    ((Err e) (Err e))))
+
+
+;; ---------------------------------------------------------------------------
+;; Transactions
+;; ---------------------------------------------------------------------------
+
+;; Runs `f` in a transaction: committed when it answers `Ok`, rolled back when
+;; it answers `Err` or throws. Nested ones are savepoints, so an inner one can
+;; fail and be rolled back while the outer one goes on.
+(: with-transaction (-> Db (-> (Result SqlError %a)) (Result SqlError %a)))
+(defun (with-transaction db f)
+  (def depth (record-ref db depth))
+  (def savepoint (str "bjosqlite_" (int->string depth)))
+  (defun (run (: text string)) : (Result SqlError int)
+    (execute-sql db (sql text Nil)))
+  (defun (undo) : void
+    (ignore (run (str "ROLLBACK TO " savepoint)))
+    (ignore (run (str "RELEASE " savepoint))))
+  (match (run (str "SAVEPOINT " savepoint))
+    ((Err e) (Err e))
+    ((Ok _)
+     (record-set! db (depth (+ depth 1)))
+     (def outcome
+       (try (try (f) #:catch (System.Exception))
+         #:finally (record-set! db (depth depth))))
+     (match outcome
+       ((Ok (Ok x))
+        (match (run (str "RELEASE " savepoint))
+          ((Ok _) (Ok x))
+          ((Err e) (undo) (Err e))))
+       ((Ok (Err e)) (undo) (Err e))
+       ((Err thrown) (undo) (raise thrown))))))

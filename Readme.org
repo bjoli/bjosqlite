@@ -1,0 +1,97 @@
+* bjosqlite — SQLite for Bjolang
+
+The [[file:../bjosql][bjosql]] query language, running on SQLite through
+Microsoft.Data.Sqlite.
+
+#+BEGIN_SRC scheme
+(import (bjosql core))
+(import (bjosqlite core))
+
+(def/table notes Note
+  (id int #:primary-key #:auto)
+  (text string)
+  (pinned bool))
+
+(defun (main)
+  (match (call-with-db "notes.db"
+           (fun (db)
+             (def (Ok _) (create-table db notes) :propagate)
+             (def (Ok n) (insert db notes (Note (id 0) (text "hello") (pinned #f))) :propagate)
+             (def (Ok _) (execute db notes '(update (set (pinned #t)) (where (id (= ,(record-ref n id)))))) :propagate)
+             (fetch db notes '(select (where (pinned (= #t))) (order-by (desc id))))))
+    ((Ok ns) (loop (:for n ns) (:do (println (record-ref n text)))) 0)
+    ((Err e) (println (sql-error-message e)) 1)))
+#+END_SRC
+
+** Using it
+
+#+BEGIN_SRC scheme
+(depends
+  (package (name (bjosqlite)) (source (path (dir "../bjosqlite")))))
+#+END_SRC
+
+~(bjosql)~ comes along with it. A program using this package declares no
+NuGet packages of its own. The package declares Microsoft.Data.Sqlite, and
+~bjo~ restores it for any build that uses the package. The package brings its
+own SQLite (SQLitePCLRaw's ~e_sqlite3~, built for each platform), so nothing
+needs to be installed. The copy for the building machine is loaded from the
+NuGet cache. See /NuGet packages/ in ~Docs/Projects.org~.
+
+** Operations
+
+Each operation returns a ~(Result SqlError ...)~.
+
+| ~(open-db path)~ ~(close-db db)~   | ~":memory:"~ is a database that is gone when it is closed |
+| ~(call-with-db path f)~            | open, call ~f~, and close however ~f~ returns   |
+| ~(create-table db t)~              | ~CREATE TABLE IF NOT EXISTS~                   |
+| ~(insert db t row)~                | the row as stored, with the key SQLite chose for an ~#:auto~ column |
+| ~(insert-all db t rows)~           | all of the rows or none of them, in one transaction |
+| ~(fetch db t '(select ...))~       | the rows, read into the table's record         |
+| ~(fetch-one db t '(select ...))~   | the first row, as an ~Option~                  |
+| ~(fetch-rows db t '(select ...))~  | the rows as ~Row~ values, for a projection     |
+| ~(execute db t '(update ...))~     | the number of rows changed; also for ~delete~  |
+| ~(query-sql db s)~ ~(execute-sql db s)~ | SQL written by hand, from ~sql~            |
+| ~(with-transaction db f)~          | commits when ~f~ returns ~Ok~; rolls back on ~Err~ or on a throw |
+
+~fetch~ reads each row into the table's record, so a projection must include
+every column. To read only some columns, use ~fetch-rows~ and ~(row-field row
+"name")~.
+
+Transactions nest. An inner transaction is a savepoint: if it fails, it is
+rolled back and the outer transaction continues.
+
+** Errors
+
+~(DbError code message)~ is SQLite refusing a statement. ~code~ is SQLite's
+result code as a string, so ~"19"~ is a constraint violation.
+~(DecodeError message)~ is a row that does not fit its record, and ~(BadQuery
+message)~ is a statement that cannot be written, such as an update with nothing
+in ~set~. Anything else is an exception, as it is everywhere else: a closed
+connection, or a ~sql~ call whose ~?~ count does not match its values.
+
+** Threads and fibers
+
+A call blocks the thread it runs on, as SQLite does. SQLite runs inside this
+process rather than as a server, so most calls finish in microseconds. To move
+a long call off a fiber, use ~(sync (blocking (fun () ...)))~. Use a ~Db~ from
+only one thread at a time.
+
+** Types
+
+| Bjolang         | Column type | Stored as         |
+|-----------------+-------------+-------------------|
+| ~int~, ~long~   | ~INTEGER~   | integer           |
+| ~double~        | ~REAL~      | real              |
+| ~string~        | ~TEXT~      | text              |
+| ~bool~          | ~BOOLEAN~   | 0 or 1            |
+| ~(Array byte)~  | ~BLOB~      | blob              |
+
+An ~#:auto~ key is an ~INTEGER PRIMARY KEY~, which is SQLite's rowid.
+
+** Try it
+
+#+BEGIN_SRC sh
+bjo run tests/sqlite.bjo                     # every line should start with "ok:"
+bjo run examples/todo.bjo add "buy milk"
+bjo run examples/todo.bjo list
+#+END_SRC

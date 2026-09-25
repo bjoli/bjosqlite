@@ -1,0 +1,192 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjosqlite/tests/sqlite.bjo — against a real SQLite, in memory.
+;;
+;;     bjo run tests/sqlite.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjosql core))
+(import (bjosqlite core))
+
+(import/class
+  (Exception (: System.Exception))
+  (InvalidOperation (: System.InvalidOperationException (-> string InvalidOperation))))
+
+(def/table users User
+  (id int #:primary-key #:auto)
+  (name string)
+  (email (Option string))
+  (age int)
+  (admin bool)
+  (score double)
+  (avatar (Option (Array byte))))
+
+(: ada User)
+(def ada (User (id 0) (name "Ada") (email (Some "ada@example.org")) (age 36)
+               (admin #t) (score 9.5) (avatar (Some #[1uy 2uy 3uy]))))
+
+(: grace User)
+(def grace (User (id 0) (name "Grace") (email None) (age 85) (admin #f) (score 7.25) (avatar None)))
+
+(: linus User)
+(def linus (User (id 0) (name "Linus") (email (Some "linus@example.org")) (age 17)
+                 (admin #f) (score 3.0) (avatar None)))
+
+(: names (-> (Result SqlError (List User)) string))
+(defun (names result)
+  (match result
+    ((Ok us) (string-join (list->vec (list-map #(record-ref & name) us)) " "))
+    ((Err e) (str "error: " (sql-error-message e)))))
+
+(: count-of (-> (Result SqlError int) string))
+(defun (count-of result)
+  (match result
+    ((Ok n) (int->string n))
+    ((Err e) (str "error: " (sql-error-message e)))))
+
+(: adults (-> int UserSelect))
+(defun (adults from) '(select (where (age (>= ,from))) (order-by name)))
+
+(: run (-> Db void))
+(defun (run db)
+  ;; --- creating and inserting -------------------------------------------------
+  (expect-true "create table" (ok? (create-table db users)))
+  (expect-true "and again, which it already is" (ok? (create-table db users)))
+
+  (def stored (insert db users ada))
+  (expect "an insert answers the row with the key SQLite chose"
+          (match stored ((Ok u) (record-ref u id)) ((Err _) -1))
+          1)
+  (expect "the rest of it survives the trip"
+          (match stored
+            ((Ok u) (str (record-ref u name) " " (->str (record-ref u email)) " "
+                         (int->string (record-ref u age)) " " (->str (record-ref u admin)) " "
+                         (double->string (record-ref u score)) " "
+                         (match (record-ref u avatar)
+                           ((Some bytes) (int->string (array-length bytes)))
+                           (None "none"))))
+            ((Err e) (sql-error-message e)))
+          "Ada (Some ada@example.org) 36 True 9.5 3")
+  (expect "insert-all"
+          (match (insert-all db users (list grace linus))
+            ((Ok us) (list-map #(record-ref & id) us))
+            ((Err _) Nil))
+          (list 2 3))
+
+  ;; --- selecting ------------------------------------------------------------------
+  (expect "fetch everything" (names (fetch db users '(select (order-by id)))) "Ada Grace Linus")
+  (expect "a condition, and an order" (names (fetch db users (adults 18))) "Ada Grace")
+  (expect "a nullable column's tests"
+          (names (fetch db users '(select (where (email is-null))))) "Grace")
+  (expect "the logic"
+          (names (fetch db users '(select (where (or (name (like "L%")) (and (admin (= #t)) (score (> 9.0)))))
+                                          (order-by (desc id)))))
+          "Linus Ada")
+  (expect "in, limit and offset"
+          (names (fetch db users '(select (where (id (in 1 2 3))) (order-by id) (limit 1) (offset 1))))
+          "Grace")
+  (expect "an offset alone"
+          (names (fetch db users '(select (order-by id) (offset 2)))) "Linus")
+  (expect "fetch-one"
+          (match (fetch-one db users '(select (where (name (= "Grace")))))
+            ((Ok (Some u)) (->str (record-ref u email)))
+            ((Ok None) "nobody")
+            ((Err e) (sql-error-message e)))
+          "None")
+  (expect "fetch-one of nothing"
+          (match (fetch-one db users '(select (where (age (> 200)))))
+            ((Ok (Some _)) "somebody")
+            ((Ok None) "nobody")
+            ((Err e) (sql-error-message e)))
+          "nobody")
+  (expect "a projection, read as rows"
+          (match (fetch-rows db users '(select (name age) (where (id (= 2)))))
+            ((Ok (Cons row _))
+             (match (row-field row "age")
+               ((Ok n) (int->string n))
+               ((Err e) (sql-error-message e))))
+            ((Ok Nil) "no rows")
+            ((Err e) (sql-error-message e)))
+          "85")
+  (expect "a projection is not a whole record"
+          (names (fetch db users '(select (name))))
+          "error: the result has no column id.")
+
+  ;; --- changing -------------------------------------------------------------------
+  (expect "update"
+          (count-of (execute db users '(update (set (email "grace@example.org") (age 86))
+                                               (where (name (= "Grace"))))))
+          "1")
+  (expect "and it was"
+          (names (fetch db users '(select (where (and (email (like "grace%")) (age (= 86))))))) "Grace")
+  (expect "set a nullable column to null"
+          (count-of (execute db users '(update (set (email null)) (where (id (= 3)))))) "1")
+  (expect "delete" (count-of (execute db users '(delete (where (age (< 18)))))) "1")
+  (expect "what is left" (names (fetch db users '(select (order-by id)))) "Ada Grace")
+
+  ;; --- by hand ----------------------------------------------------------------------
+  (expect "a query by hand"
+          (match (query-sql db (sql "SELECT count(*) AS n, max(age) AS oldest FROM users WHERE age > ?"
+                                    (list (to-sql 20))))
+            ((Ok (Cons row _))
+             (match (Tuple (row-field row "n") (row-field row "oldest"))
+               ((Tuple (Ok n) (Ok oldest)) (str (long->string n) " " (long->string oldest)))
+               (_ "not numbers")))
+            (_ "failed"))
+          "2 86")
+
+  ;; --- errors -----------------------------------------------------------------------
+  (expect "the database's refusal is an Err with SQLite's code"
+          (match (execute-sql db (sql "INSERT INTO users (id, name, age, admin, score) VALUES (1, 'x', 1, 0, 0)" Nil))
+            ((Err (DbError code _)) code)
+            ((Err e) (sql-error-message e))
+            ((Ok _) "inserted"))
+          "19")
+  (expect-true "and the message says why"
+               (match (execute-sql db (sql "SELECT * FROM nowhere" Nil))
+                 ((Err e) (string-contains? (sql-error-message e) "no such table"))
+                 ((Ok _) #f)))
+
+  ;; --- transactions -----------------------------------------------------------------
+  (expect "an Err rolls back"
+          (match (with-transaction db
+                   (fun ()
+                     (ignore (insert db users linus))
+                     (Err (BadQuery "changed my mind"))))
+            ((Err e) (sql-error-message e))
+            ((Ok _) "committed"))
+          "changed my mind")
+  (expect "and nothing was inserted" (names (fetch db users '(select (order-by id)))) "Ada Grace")
+  (expect "an Ok commits"
+          (count-of (with-transaction db (fun () (execute db users '(update (set (score 1.0)))))))
+          "2")
+  (expect "a failed inner transaction leaves the outer one going"
+          (names
+            (with-transaction db
+              (fun ()
+                (ignore (insert db users linus))
+                (ignore (with-transaction db
+                          (fun ()
+                            (ignore (execute db users '(delete)))
+                            (Err (BadQuery "no")))))
+                (fetch db users '(select (order-by id))))))
+          "Ada Grace Linus")
+  (expect-true "a throw rolls back and is thrown on"
+               (match (try (with-transaction db
+                             (fun ()
+                               (ignore (execute db users '(delete)))
+                               (raise (cast Exception (InvalidOperation. "boom")))))
+                        #:catch (System.InvalidOperationException))
+                 ((Err _) #t)
+                 ((Ok _) #f)))
+  (expect "so the rows are still there" (names (fetch db users '(select (order-by id)))) "Ada Grace Linus"))
+
+(defun (main args)
+  (match (call-with-db ":memory:" (fun (db) (run db) (Ok unit)))
+    ((Ok _) 0)
+    ((Err e) (println (str "FAILURE: " (sql-error-message e))) 1)))

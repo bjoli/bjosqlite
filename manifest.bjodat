@@ -5,7 +5,9 @@
   (license "MPL-2.0")
 
   (depends
-    (package (name (bjosql)) (source (path (dir "../bjosql")))))
+    (package (name (bjosql))
+             (version (version-at-least "0.1.0"))
+             (source (git (url "https://github.com/bjoli/bjosql")))))
 
   ;; Brings its own SQLite, built for each platform (SQLitePCLRaw's
   ;; e_sqlite3), so nothing has to be installed. A program using this

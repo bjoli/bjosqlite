@@ -1,6 +1,6 @@
 * bjosqlite — SQLite for Bjolang
 
-The [[file:../bjosql][bjosql]] query language, running on SQLite through
+The [[https://github.com/bjoli/bjosql][bjosql]] query language, running on SQLite through
 Microsoft.Data.Sqlite.
 
 #+BEGIN_SRC scheme
@@ -27,7 +27,9 @@ Microsoft.Data.Sqlite.
 
 #+BEGIN_SRC scheme
 (depends
-  (package (name (bjosqlite)) (source (path (dir "../bjosqlite")))))
+  (package (name (bjosqlite))
+           (version (version-at-least "0.1.0"))
+           (source (git (url "https://github.com/bjoli/bjosqlite")))))
 #+END_SRC
 
 ~(bjosql)~ comes along with it. A program using this package declares no

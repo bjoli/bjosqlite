@@ -1,6 +1,6 @@
 (package
   (name (bjosqlite))
-  (version "0.1.0")
+  (version "0.2.0")
   (description "SQLite for Bjolang: the bjosql query language over Microsoft.Data.Sqlite.")
   (license "MPL-2.0")
 

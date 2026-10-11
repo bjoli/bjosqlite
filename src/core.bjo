@@ -179,7 +179,9 @@
       ((SqlNull) (cast System.Object db-null))
       ((SqlInt i) (cast System.Object i))
       ((SqlReal d) (cast System.Object d))
-      ((SqlText s) (cast System.Object s))
+      ;; A Bjolang string is a UTF-8 string, which SQLite has no mapping for:
+      ;; the .NET string is what binds as TEXT.
+      ((SqlText s) (cast System.Object (string->clr-string s)))
       ((SqlBlob b) (cast System.Object b))
       ((SqlBool b) (cast System.Object b))))
   (ignore (add-value ps name value)))

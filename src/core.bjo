@@ -95,14 +95,27 @@
 ;; SQLite's column types are affinities, and these are the names that give
 ;; each Bjolang type the one it wants. `BOOLEAN` has NUMERIC affinity and
 ;; stores 0 and 1.
+;;
+;; SQLite has no type for a date, a time, a decimal, a uuid or JSON. They are
+;; stored as `stored-text` writes them, in a TEXT column. Not DATE or DECIMAL:
+;; those names have NUMERIC affinity, and SQLite would store `12.50` as the
+;; real 12.5.
 (: sqlite-type-name (-> ColumnType string))
 (defun (sqlite-type-name t)
   (match t
     ((IntegerType) "INTEGER")
+    ((Int32Type) "INTEGER")
     ((RealType) "REAL")
     ((TextType) "TEXT")
     ((BlobType) "BLOB")
     ((BoolType) "BOOLEAN")
+    ((DateType) "TEXT")
+    ((TimeType) "TEXT")
+    ((TimestampType) "TEXT")
+    ((InstantType) "TEXT")
+    ((DecimalType) "TEXT")
+    ((UuidType) "TEXT")
+    ((JsonType) "TEXT")
     ((CustomType name) name)))
 
 ;; `@p1`, `@p2`: Microsoft.Data.Sqlite binds parameters by name. An
@@ -171,6 +184,13 @@
 ;; Running statements
 ;; ---------------------------------------------------------------------------
 
+;; A value SQLite has no type for, as the text bjosql specifies for it.
+(: stored (-> SqlValue Object))
+(defun (stored v)
+  (match (stored-text v)
+    ((Some s) (cast System.Object (string->clr-string s)))
+    (None (panic! (str "bjosqlite: no stored text for " (describe-sql-value v))))))
+
 (: bind! (-> Parameters int SqlValue void))
 (defun (bind! ps n v)
   (def name (str "@p" (int->string n)))
@@ -183,7 +203,17 @@
       ;; the .NET string is what binds as TEXT.
       ((SqlText s) (cast System.Object (string->clr-string s)))
       ((SqlBlob b) (cast System.Object b))
-      ((SqlBool b) (cast System.Object b))))
+      ((SqlBool b) (cast System.Object b))
+      ;; The types SQLite does not have, as text. Each case is named, so that
+      ;; a case bjosql adds is a compile error here and not a guess.
+      ((SqlDate _) (stored v))
+      ((SqlTime _) (stored v))
+      ((SqlTimestamp _) (stored v))
+      ((SqlInstant _) (stored v))
+      ((SqlDecimal _) (stored v))
+      ((SqlUuid _) (stored v))
+      ((SqlJson _) (stored v))
+      ((SqlOther _ _) (stored v))))
   (ignore (add-value ps name value)))
 
 ;; A command for `s`, with its parameters bound, handed to `f` and disposed of

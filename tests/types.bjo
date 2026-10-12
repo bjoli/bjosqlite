@@ -1,0 +1,126 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjosqlite/tests/types.bjo — the types SQLite does not have, through a real
+;; database in memory: each written and read back equal, stored as the text
+;; bjosql specifies, and sorted by SQL in the order of the values.
+;;
+;;     bjo run tests/types.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (std datetime))
+(import (std uuid))
+(import (bjosql core))
+(import (bjosqlite core))
+
+(def/table events Event
+  (key Uuid #:primary-key)
+  (day Date)
+  (at Time)
+  (local DateTime)
+  (happened Instant)
+  (price decimal)
+  (doc JsonDoc)
+  (count int)
+  (note (Option Instant)))
+
+(: some! (-> (Option %a) %a))
+(defun (some! o)
+  (match o
+    ((Some x) x)
+    (None (panic! "expected a value"))))
+
+(: instant (-> string Instant))
+(defun (instant s) (some! (iso8601->instant s)))
+
+(: ok! (-> (Result SqlError %a) %a))
+(defun (ok! r)
+  (match r
+    ((Ok x) x)
+    ((Err e) (panic! (sql-error-message e)))))
+
+(: event (-> Uuid string string Event))
+(defun (event key when price)
+  (Event (key key)
+         (day (some! (date 2026 10 12)))
+         (at (some! (time 14 5 #:seconds 9 #:nanoseconds 250000000)))
+         (local (some! (datetime 2026 10 12 #:hours 14 #:minutes 5 #:seconds 9 #:nanoseconds 123456000)))
+         (happened (instant when))
+         (price (string->decimal price))
+         (doc (json-doc "{\"tags\": [\"knee\", \"back\"]}"))
+         (count 3)
+         (note None)))
+
+;; The text of one column of every row, in the order SQL gave them.
+(: column-text (-> Db string string (List string)))
+(defun (column-text db query column)
+  (list-map (fun (row) (match (row-field row column)
+                         ((Ok (SqlText s)) s)
+                         ((Ok v) (describe-sql-value v))
+                         ((Err e) (sql-error-message e))))
+            (ok! (query-sql db (sql query Nil)))))
+
+(defun (main args)
+  (match (open-db ":memory:")
+    ((Err e) (println (str "FAILURE: open: " (sql-error-message e))))
+    ((Ok db)
+     (ignore (ok! (create-table db events)))
+     (expect "the new types are declared TEXT"
+             (column-text db "SELECT type AS t FROM pragma_table_info('events') ORDER BY cid" "t")
+             (list "TEXT" "TEXT" "TEXT" "TEXT" "TEXT" "TEXT" "TEXT" "INTEGER" "TEXT"))
+
+     ;; ---- written and read back ------------------------------------------
+     (def first (event (uuid-v7) "2026-10-12T09:00:00.5Z" "12.50"))
+     (def stored (ok! (insert db events first)))
+     (expect "a row of every new type comes back equal"
+             (list (= (record-ref stored key) (record-ref first key))
+                   (= (compare (record-ref stored day) (record-ref first day)) 0)
+                   (= (compare (record-ref stored at) (record-ref first at)) 0)
+                   (= (compare (record-ref stored local) (record-ref first local)) 0)
+                   (= (compare (record-ref stored happened) (record-ref first happened)) 0)
+                   (= (decimal->string (record-ref stored price)) "12.50")
+                   (= (json-doc-text (record-ref stored doc)) (json-doc-text (record-ref first doc)))
+                   (= (record-ref stored count) 3)
+                   (none? (record-ref stored note)))
+             (list #t #t #t #t #t #t #t #t #t))
+     (expect "stored as the text bjosql specifies"
+             (column-text db "SELECT day || ' ' || at || ' ' || local || ' ' || happened || ' ' || price AS t FROM events" "t")
+             (list "2026-10-12 14:05:09.250000 2026-10-12 14:05:09.123456 2026-10-12 09:00:00.500000Z 12.50"))
+     (expect "SQLite's own date functions read the stored text"
+             (column-text db "SELECT strftime('%Y-%m-%dT%H:%M:%f', happened) AS t FROM events" "t")
+             (list "2026-10-12T09:00:00.500"))
+
+     ;; ---- queries with the new types --------------------------------------
+     (ignore (ok! (insert db events (event (uuid-v7) "2026-10-12T09:00:00.25Z" "7.00"))))
+     (ignore (ok! (insert db events (event (uuid-v7) "2026-10-12T09:00:00Z" "100.00"))))
+     (ignore (ok! (insert db events (event (uuid-v7) "2026-10-12T10:00:00+02:00" "-3.00"))))
+     (expect "ORDER BY an instant column sorts by time, whatever the fraction or the offset"
+             (list-map (fun (e) (->str (record-ref e happened)))
+                       (ok! (fetch db events '(select (order-by happened)))))
+             (list "2026-10-12T08:00:00Z" "2026-10-12T09:00:00Z"
+                   "2026-10-12T09:00:00.25Z" "2026-10-12T09:00:00.5Z"))
+     (expect "ORDER BY a version 7 uuid sorts by the time it was made"
+             (list-map (fun (e) (decimal->string (record-ref e price)))
+                       (ok! (fetch db events '(select (order-by key)))))
+             (list "12.50" "7.00" "100.00" "-3.00"))
+     (expect "a test on an instant"
+             (list-length (ok! (fetch db events '(select (where (happened (>= ,(instant "2026-10-12T09:00:00.25Z"))))))))
+             2)
+     (expect "a test on a uuid"
+             (list-length (ok! (fetch db events '(select (where (key (= ,(record-ref first key))))))))
+             1)
+     (expect "an update of a nullable instant"
+             (ok! (execute db events '(update (set (note ,(Some (instant "2026-01-01T00:00:00Z"))))
+                                              (where (key (= ,(record-ref first key)))))))
+             1)
+     (expect "and it reads back"
+             (match (ok! (fetch-one db events '(select (where (note not-null)))))
+               ((Some e) (->str (record-ref e note)))
+               (None "none"))
+             "(Some 2026-01-01T00:00:00Z)")
+     (close-db db)))
+  0)

@@ -80,13 +80,29 @@ only one thread at a time.
 
 ** Types
 
-| Bjolang         | Column type | Stored as         |
-|-----------------+-------------+-------------------|
-| ~int~, ~long~   | ~INTEGER~   | integer           |
-| ~double~        | ~REAL~      | real              |
-| ~string~        | ~TEXT~      | text              |
-| ~bool~          | ~BOOLEAN~   | 0 or 1            |
-| ~(Array byte)~  | ~BLOB~      | blob              |
+| Bjolang         | Column type | Stored as                       |
+|-----------------+-------------+---------------------------------|
+| ~int~, ~long~   | ~INTEGER~   | integer                         |
+| ~double~        | ~REAL~      | real                            |
+| ~string~        | ~TEXT~      | text                            |
+| ~bool~          | ~BOOLEAN~   | 0 or 1                          |
+| ~(Array byte)~  | ~BLOB~      | blob                            |
+| ~Date~          | ~TEXT~      | ~2026-10-12~                    |
+| ~Time~          | ~TEXT~      | ~14:05:09.000000~               |
+| ~DateTime~      | ~TEXT~      | ~2026-10-12 14:05:09.000000~    |
+| ~Instant~       | ~TEXT~      | ~2026-10-12 12:05:09.000000Z~   |
+| ~decimal~       | ~TEXT~      | ~-12.50~                        |
+| ~Uuid~          | ~TEXT~      | lower case, with hyphens        |
+| ~JsonDoc~       | ~TEXT~      | the JSON text                   |
+
+SQLite has no type for the last seven. bjosql specifies one text for each,
+with a fixed width and an instant always in UTC, so that ~ORDER BY~ and ~<~ in
+SQL give the order of the values, and SQLite's own date functions read them. A
+version 7 uuid sorts by the time it was made. The columns are declared ~TEXT~:
+a ~DECIMAL~ column would store ~12.50~ as the real 12.5.
+
+A decimal is exact, but SQL compares the text: ~"10.0" < "9.0"~, and ~SUM~
+adds it as reals. Compare and add decimals in Bjolang.
 
 An ~#:auto~ key is an ~INTEGER PRIMARY KEY~, which is SQLite's rowid.
 
@@ -94,6 +110,7 @@ An ~#:auto~ key is an ~INTEGER PRIMARY KEY~, which is SQLite's rowid.
 
 #+BEGIN_SRC sh
 bjo run tests/sqlite.bjo                     # every line should start with "ok:"
+bjo run tests/types.bjo                      # the types SQLite does not have
 bjo run examples/todo.bjo add "buy milk"
 bjo run examples/todo.bjo list
 #+END_SRC

@@ -1,5 +1,5 @@
 (lock
   (locked
-    (package (name (bjosql)) (version "0.3.2")
+    (package (name (bjosql)) (version "0.4.0")
              (source (git (url "https://github.com/bjoli/bjosql")))
-             (commit "61a47982b9054c08dbed3bb96c4ef3dfb6f79d7e"))))
+             (commit "8536b7ea3c887fca244cc65d721a8db9a49d5b51"))))

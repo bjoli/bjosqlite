@@ -99,7 +99,7 @@
      (ignore (ok! (insert db events (event (uuid-v7) "2026-10-12T09:00:00Z" "100.00"))))
      (ignore (ok! (insert db events (event (uuid-v7) "2026-10-12T10:00:00+02:00" "-3.00"))))
      (expect "ORDER BY an instant column sorts by time, whatever the fraction or the offset"
-             (list-map (fun (e) (->str (record-ref e happened)))
+             (list-map (fun (e) (displayed (record-ref e happened)))
                        (ok! (fetch db events '(select (order-by happened)))))
              (list "2026-10-12T08:00:00Z" "2026-10-12T09:00:00Z"
                    "2026-10-12T09:00:00.25Z" "2026-10-12T09:00:00.5Z"))
@@ -119,7 +119,7 @@
              1)
      (expect "and it reads back"
              (match (ok! (fetch-one db events '(select (where (note not-null)))))
-               ((Some e) (->str (record-ref e note)))
+               ((Some e) (displayed (record-ref e note)))
                (None "none"))
              "(Some 2026-01-01T00:00:00Z)")
      (close-db db)))

@@ -64,14 +64,14 @@
           1)
   (expect "the rest of it survives the trip"
           (match stored
-            ((Ok u) (str (record-ref u name) " " (->str (record-ref u email)) " "
-                         (int->string (record-ref u age)) " " (->str (record-ref u admin)) " "
+            ((Ok u) (str (record-ref u name) " " (displayed (record-ref u email)) " "
+                         (int->string (record-ref u age)) " " (displayed (record-ref u admin)) " "
                          (double->string (record-ref u score)) " "
                          (match (record-ref u avatar)
                            ((Some bytes) (int->string (array-length bytes)))
                            (None "none"))))
             ((Err e) (sql-error-message e)))
-          "Ada (Some ada@example.org) 36 True 9.5 3")
+          "Ada (Some ada@example.org) 36 #t 9.5 3")
   (expect "insert-all"
           (match (insert-all db users (list grace linus))
             ((Ok us) (list-map #(record-ref & id) us))
@@ -94,7 +94,7 @@
           (names (fetch db users '(select (order-by id) (offset 2)))) "Linus")
   (expect "fetch-one"
           (match (fetch-one db users '(select (where (name (= "Grace")))))
-            ((Ok (Some u)) (->str (record-ref u email)))
+            ((Ok (Some u)) (displayed (record-ref u email)))
             ((Ok None) "nobody")
             ((Err e) (sql-error-message e)))
           "None")
